@@ -33,6 +33,11 @@ final class SessionStats
     void addPvpKill(long lootValue)
     {
         pvpKills++;
+        addPvpLoot(lootValue);
+    }
+
+    void addPvpLoot(long lootValue)
+    {
         pvpLoot += lootValue;
         biggestPk = Math.max(biggestPk, lootValue);
     }

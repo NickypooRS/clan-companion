@@ -20,7 +20,6 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Player;
-import net.runelite.api.Varbits;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameStateChanged;
@@ -48,6 +47,7 @@ import net.runelite.client.util.Text;
 public class ClanCompanionPlugin extends Plugin
 {
     private static final int MAX_FEED_ENTRIES = 60;
+    private static final int PVP_INTERACTION_TIMEOUT_TICKS = 12;
     private static final String COLLECTION_LOG_PREFIX = "New item added to your collection log:";
 
     @Inject private Client client;
@@ -63,6 +63,10 @@ public class ClanCompanionPlugin extends Plugin
     private ClanCompanionPanel panel;
     private NavigationButton navButton;
     private int tickCounter;
+    private String recentPvpOpponent;
+    private int recentPvpOpponentTick = Integer.MIN_VALUE;
+    private String lastCountedPvpKill;
+    private int lastCountedPvpKillTick = Integer.MIN_VALUE;
     private String latestShareEvent = "No notable activity yet.";
 
     @Provides
@@ -109,11 +113,24 @@ public class ClanCompanionPlugin extends Plugin
         }
 
         long value = valueOf(event.getItems());
-        stats.addPvpKill(value);
         String target = event.getPlayer() != null && event.getPlayer().getName() != null
             ? event.getPlayer().getName() : "player";
 
-        addActivity(ActivityEntry.Type.PVP, "PvP kill: " + target + " — " + formatGp(value));
+        // ActorDeath is the primary kill signal. PlayerLootReceived supplies the loot value.
+        // If the death event was missed, this remains a safe fallback for a loot-producing PK.
+        if (samePlayer(target, lastCountedPvpKill)
+            && tickCounter - lastCountedPvpKillTick <= PVP_INTERACTION_TIMEOUT_TICKS)
+        {
+            stats.addPvpLoot(value);
+        }
+        else
+        {
+            stats.addPvpKill(value);
+            lastCountedPvpKill = target;
+            lastCountedPvpKillTick = tickCounter;
+        }
+
+        addActivity(ActivityEntry.Type.PVP, "PvP loot: " + target + " — " + formatGp(value));
         latestShareEvent = "Misinformed — PvP Kill\nOpponent: " + target + "\nLoot: " + formatGp(value);
     }
 
@@ -141,9 +158,7 @@ public class ClanCompanionPlugin extends Plugin
                 String name = composition == null ? "Item " + item.getId() : composition.getName();
 
                 stats.addValuableDrop(name, itemValue);
-                addActivity(ActivityEntry.Type.DROP,
-                    "Valuable drop: " + name + " — " + formatGp(itemValue));
-
+                addActivity(ActivityEntry.Type.DROP, "Valuable drop: " + name + " — " + formatGp(itemValue));
                 latestShareEvent = "Misinformed — Valuable Drop\nItem: " + name
                     + "\nFrom: " + npc + "\nValue: " + formatGp(itemValue);
 
@@ -194,20 +209,104 @@ public class ClanCompanionPlugin extends Plugin
 
         Actor actor = event.getActor();
         Player local = client.getLocalPlayer();
-        if (actor == local && client.getVarbitValue(Varbits.PVP_SPEC_ORB) == 1)
+        if (local == null)
         {
-            stats.addPvpDeath();
-            addActivity(ActivityEntry.Type.DEATH, "PvP-area death recorded");
+            return;
+        }
+
+        if (actor == local)
+        {
+            if (hasRecentPvpInteraction())
+            {
+                stats.addPvpDeath();
+                addActivity(ActivityEntry.Type.DEATH, "PvP death to " + recentPvpOpponent);
+            }
+            return;
+        }
+
+        if (!(actor instanceof Player))
+        {
+            return;
+        }
+
+        Player deadPlayer = (Player) actor;
+        String target = deadPlayer.getName();
+        if (target == null)
+        {
+            return;
+        }
+
+        boolean directlyInteracting = local.getInteracting() == deadPlayer || deadPlayer.getInteracting() == local;
+        boolean recentlyFought = samePlayer(target, recentPvpOpponent) && hasRecentPvpInteraction();
+        if (directlyInteracting || recentlyFought)
+        {
+            stats.addPvpKill(0);
+            lastCountedPvpKill = target;
+            lastCountedPvpKillTick = tickCounter;
+            addActivity(ActivityEntry.Type.PVP, "PvP kill: " + target);
+            latestShareEvent = "Misinformed — PvP Kill\nOpponent: " + target + "\nLoot: pending";
         }
     }
 
     @Subscribe
     public void onGameTick(GameTick event)
     {
-        if (++tickCounter % 5 == 0)
+        tickCounter++;
+        trackPvpInteraction();
+        if (tickCounter % 5 == 0)
         {
             refreshPanel();
         }
+    }
+
+    private void trackPvpInteraction()
+    {
+        if (!config.trackPvp())
+        {
+            return;
+        }
+
+        Player local = client.getLocalPlayer();
+        if (local == null)
+        {
+            return;
+        }
+
+        Actor interacting = local.getInteracting();
+        if (interacting instanceof Player)
+        {
+            rememberPvpOpponent((Player) interacting);
+            return;
+        }
+
+        for (Player player : client.getPlayers())
+        {
+            if (player != null && player != local && player.getInteracting() == local)
+            {
+                rememberPvpOpponent(player);
+                return;
+            }
+        }
+    }
+
+    private void rememberPvpOpponent(Player player)
+    {
+        if (player.getName() != null)
+        {
+            recentPvpOpponent = player.getName();
+            recentPvpOpponentTick = tickCounter;
+        }
+    }
+
+    private boolean hasRecentPvpInteraction()
+    {
+        return recentPvpOpponent != null
+            && tickCounter - recentPvpOpponentTick <= PVP_INTERACTION_TIMEOUT_TICKS;
+    }
+
+    private boolean samePlayer(String a, String b)
+    {
+        return a != null && b != null && Text.standardize(a).equals(Text.standardize(b));
     }
 
     @Subscribe
@@ -295,10 +394,12 @@ public class ClanCompanionPlugin extends Plugin
     }
 
     SessionStats getStats() { return stats; }
+
     List<ActivityEntry> getActivitySnapshot()
     {
         return Collections.unmodifiableList(new ArrayList<>(activity));
     }
+
     int getPvpChallengeTarget() { return config.pvpChallengeGoal(); }
     int getPvmChallengeTarget() { return config.pvmChallengeGoal(); }
 
@@ -306,6 +407,10 @@ public class ClanCompanionPlugin extends Plugin
     {
         stats.reset();
         activity.clear();
+        recentPvpOpponent = null;
+        recentPvpOpponentTick = Integer.MIN_VALUE;
+        lastCountedPvpKill = null;
+        lastCountedPvpKillTick = Integer.MIN_VALUE;
         latestShareEvent = "No notable activity yet.";
         addActivity(ActivityEntry.Type.PVM, "Session reset");
     }
