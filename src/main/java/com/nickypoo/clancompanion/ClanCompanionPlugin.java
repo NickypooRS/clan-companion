@@ -20,10 +20,13 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Player;
+import net.runelite.api.TileItem;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ItemSpawned;
 import net.runelite.client.Notifier;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -48,6 +51,7 @@ public class ClanCompanionPlugin extends Plugin
 {
     private static final int MAX_FEED_ENTRIES = 60;
     private static final int PVP_INTERACTION_TIMEOUT_TICKS = 12;
+    private static final int PVP_LOOT_CAPTURE_TICKS = 3;
     private static final String COLLECTION_LOG_PREFIX = "New item added to your collection log:";
 
     @Inject private Client client;
@@ -60,6 +64,7 @@ public class ClanCompanionPlugin extends Plugin
 
     private final SessionStats stats = new SessionStats();
     private final Deque<ActivityEntry> activity = new ArrayDeque<>();
+    private final List<GroundSpawn> groundSpawnsThisTick = new ArrayList<>();
     private ClanCompanionPanel panel;
     private NavigationButton navButton;
     private int tickCounter;
@@ -67,6 +72,13 @@ public class ClanCompanionPlugin extends Plugin
     private int recentPvpOpponentTick = Integer.MIN_VALUE;
     private String lastCountedPvpKill;
     private int lastCountedPvpKillTick = Integer.MIN_VALUE;
+    private String pendingPvpLootTarget;
+    private WorldPoint pendingPvpLootPoint;
+    private int pendingPvpLootUntilTick = Integer.MIN_VALUE;
+    private long pendingPvpLootValue;
+    private long pendingPvpLootFallbackValue;
+    private String lastFinalizedPvpLootTarget;
+    private int lastFinalizedPvpLootTick = Integer.MIN_VALUE;
     private String latestShareEvent = "No notable activity yet.";
 
     @Provides
@@ -102,6 +114,8 @@ public class ClanCompanionPlugin extends Plugin
         panel = null;
         navButton = null;
         activity.clear();
+        groundSpawnsThisTick.clear();
+        clearPendingPvpLoot();
     }
 
     @Subscribe
@@ -116,8 +130,21 @@ public class ClanCompanionPlugin extends Plugin
         String target = event.getPlayer() != null && event.getPlayer().getName() != null
             ? event.getPlayer().getName() : "player";
 
-        // ActorDeath is the primary kill signal. PlayerLootReceived supplies the loot value.
-        // If the death event was missed, this remains a safe fallback for a loot-producing PK.
+        // Ground item spawns are the primary loot-value source. Keep this event as a fallback.
+        if (samePlayer(target, pendingPvpLootTarget)
+            && tickCounter <= pendingPvpLootUntilTick)
+        {
+            pendingPvpLootFallbackValue = Math.max(pendingPvpLootFallbackValue, value);
+            return;
+        }
+
+        // Ignore a late duplicate event for a kill whose ground loot was already finalized.
+        if (samePlayer(target, lastFinalizedPvpLootTarget)
+            && tickCounter - lastFinalizedPvpLootTick <= PVP_INTERACTION_TIMEOUT_TICKS)
+        {
+            return;
+        }
+
         if (samePlayer(target, lastCountedPvpKill)
             && tickCounter - lastCountedPvpKillTick <= PVP_INTERACTION_TIMEOUT_TICKS)
         {
@@ -132,6 +159,27 @@ public class ClanCompanionPlugin extends Plugin
 
         addActivity(ActivityEntry.Type.PVP, "PvP loot: " + target + " — " + formatGp(value));
         latestShareEvent = "Misinformed — PvP Kill\nOpponent: " + target + "\nLoot: " + formatGp(value);
+    }
+
+    @Subscribe
+    public void onItemSpawned(ItemSpawned event)
+    {
+        if (!config.trackPvp())
+        {
+            return;
+        }
+
+        TileItem item = event.getItem();
+        WorldPoint point = event.getTile().getWorldLocation();
+        GroundSpawn spawn = new GroundSpawn(point, item.getId(), item.getQuantity());
+        groundSpawnsThisTick.add(spawn);
+
+        if (pendingPvpLootPoint != null
+            && tickCounter <= pendingPvpLootUntilTick
+            && pendingPvpLootPoint.equals(point))
+        {
+            capturePvpGroundSpawn(spawn);
+        }
     }
 
     @Subscribe
@@ -245,6 +293,7 @@ public class ClanCompanionPlugin extends Plugin
             lastCountedPvpKillTick = tickCounter;
             addActivity(ActivityEntry.Type.PVP, "PvP kill: " + target);
             latestShareEvent = "Misinformed — PvP Kill\nOpponent: " + target + "\nLoot: pending";
+            beginPvpLootCapture(target, deadPlayer.getWorldLocation());
         }
     }
 
@@ -252,11 +301,87 @@ public class ClanCompanionPlugin extends Plugin
     public void onGameTick(GameTick event)
     {
         tickCounter++;
+
+        if (pendingPvpLootTarget != null && tickCounter > pendingPvpLootUntilTick)
+        {
+            finalizePendingPvpLoot();
+        }
+
         trackPvpInteraction();
+        groundSpawnsThisTick.clear();
+
         if (tickCounter % 5 == 0)
         {
             refreshPanel();
         }
+    }
+
+    private void beginPvpLootCapture(String target, WorldPoint point)
+    {
+        if (pendingPvpLootTarget != null)
+        {
+            finalizePendingPvpLoot();
+        }
+
+        pendingPvpLootTarget = target;
+        pendingPvpLootPoint = point;
+        pendingPvpLootUntilTick = tickCounter + PVP_LOOT_CAPTURE_TICKS;
+        pendingPvpLootValue = 0;
+        pendingPvpLootFallbackValue = 0;
+
+        // If item spawns were observed earlier in the same client tick, include them too.
+        for (GroundSpawn spawn : groundSpawnsThisTick)
+        {
+            if (point.equals(spawn.point))
+            {
+                capturePvpGroundSpawn(spawn);
+            }
+        }
+    }
+
+    private void capturePvpGroundSpawn(GroundSpawn spawn)
+    {
+        long value = itemValue(new ItemStack(spawn.itemId, spawn.quantity));
+        if (value <= 0)
+        {
+            return;
+        }
+
+        pendingPvpLootValue += value;
+        stats.addPvpLoot(value);
+        refreshPanel();
+    }
+
+    private void finalizePendingPvpLoot()
+    {
+        if (pendingPvpLootTarget == null)
+        {
+            return;
+        }
+
+        long finalValue = pendingPvpLootValue;
+        if (finalValue == 0 && pendingPvpLootFallbackValue > 0)
+        {
+            finalValue = pendingPvpLootFallbackValue;
+            stats.addPvpLoot(finalValue);
+        }
+
+        addActivity(ActivityEntry.Type.PVP,
+            "PvP loot: " + pendingPvpLootTarget + " — " + formatGp(finalValue));
+        latestShareEvent = "Misinformed — PvP Kill\nOpponent: " + pendingPvpLootTarget
+            + "\nLoot: " + formatGp(finalValue);
+        lastFinalizedPvpLootTarget = pendingPvpLootTarget;
+        lastFinalizedPvpLootTick = tickCounter;
+        clearPendingPvpLoot();
+    }
+
+    private void clearPendingPvpLoot()
+    {
+        pendingPvpLootTarget = null;
+        pendingPvpLootPoint = null;
+        pendingPvpLootUntilTick = Integer.MIN_VALUE;
+        pendingPvpLootValue = 0;
+        pendingPvpLootFallbackValue = 0;
     }
 
     private void trackPvpInteraction()
@@ -407,10 +532,14 @@ public class ClanCompanionPlugin extends Plugin
     {
         stats.reset();
         activity.clear();
+        groundSpawnsThisTick.clear();
         recentPvpOpponent = null;
         recentPvpOpponentTick = Integer.MIN_VALUE;
         lastCountedPvpKill = null;
         lastCountedPvpKillTick = Integer.MIN_VALUE;
+        lastFinalizedPvpLootTarget = null;
+        lastFinalizedPvpLootTick = Integer.MIN_VALUE;
+        clearPendingPvpLoot();
         latestShareEvent = "No notable activity yet.";
         addActivity(ActivityEntry.Type.PVM, "Session reset");
     }
@@ -433,5 +562,19 @@ public class ClanCompanionPlugin extends Plugin
             + "Valuable drops: " + stats.getValuableDrops() + " | Best: " + stats.getBestPvmDrop()
             + (stats.getBestPvmDropValue() > 0
                 ? " (" + formatGp(stats.getBestPvmDropValue()) + ")" : "");
+    }
+
+    private static final class GroundSpawn
+    {
+        private final WorldPoint point;
+        private final int itemId;
+        private final int quantity;
+
+        private GroundSpawn(WorldPoint point, int itemId, int quantity)
+        {
+            this.point = point;
+            this.itemId = itemId;
+            this.quantity = quantity;
+        }
     }
 }
